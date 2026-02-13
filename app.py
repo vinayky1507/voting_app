@@ -8,24 +8,22 @@ import time
 st.set_page_config(page_title="Voting Portal", layout="wide")
 
 # ======================================================
-# DATABASE CONNECTION (LOCK SAFE + FOREIGN KEY SAFE)
+# DATABASE CONNECTION (CLOUD SAFE VERSION)
 # ======================================================
 
 @st.cache_resource
 def get_connection():
     conn = sqlite3.connect(
         "voting_system.db",
-        check_same_thread=False,
-        timeout=30
+        check_same_thread=False
     )
-    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 conn = get_connection()
 
 # ======================================================
-# SAFE EXECUTE (STRONG LOCK SAFE)
+# SAFE EXECUTE (LOCK SAFE)
 # ======================================================
 
 def safe_execute(query, params=()):
@@ -75,6 +73,23 @@ CREATE TABLE IF NOT EXISTS votes (
 conn.commit()
 
 # ======================================================
+# SAFE MIGRATION (AUTO FIX FOR CLOUD)
+# ======================================================
+
+columns = [col[1] for col in conn.execute("PRAGMA table_info(users)").fetchall()]
+
+if "vote_limit" not in columns:
+    conn.execute("ALTER TABLE users ADD COLUMN vote_limit INTEGER DEFAULT 1")
+
+if "vote_weight" not in columns:
+    conn.execute("ALTER TABLE users ADD COLUMN vote_weight INTEGER DEFAULT 1")
+
+conn.commit()
+
+safe_execute("UPDATE users SET vote_limit=1 WHERE vote_limit IS NULL")
+safe_execute("UPDATE users SET vote_weight=1 WHERE vote_weight IS NULL")
+
+# ======================================================
 # HASH FUNCTION
 # ======================================================
 
@@ -82,7 +97,7 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 # ======================================================
-# DEFAULT ADMIN
+# DEFAULT ADMIN (Super Admin)
 # ======================================================
 
 if not conn.execute("SELECT * FROM users WHERE email='admin@admin.com'").fetchone():
@@ -134,22 +149,28 @@ if "role" not in st.session_state:
     st.session_state.role = None
 
 # ======================================================
-# LIVE SCORE BOARD (WEIGHTED)
+# 🏆 LIVE SCORE BOARD (SAFE QUERY)
 # ======================================================
 
 st.markdown("## 🏆 Live Score Board")
 
-df_live = pd.read_sql("""
-SELECT v.candidate,
-       SUM(v.score * u.vote_weight) as total
-FROM votes v
-JOIN users u ON v.email = u.email
-GROUP BY v.candidate
-ORDER BY total DESC
-""", conn)
+try:
+    df_live = pd.read_sql("""
+    SELECT v.candidate,
+           SUM(v.score * COALESCE(u.vote_weight,1)) as total
+    FROM votes v
+    JOIN users u ON v.email = u.email
+    GROUP BY v.candidate
+    ORDER BY total DESC
+    """, conn)
 
-if not df_live.empty:
-    st.dataframe(df_live, use_container_width=True)
+    if not df_live.empty:
+        st.dataframe(df_live, use_container_width=True)
+    else:
+        st.info("No votes yet.")
+
+except:
+    st.info("Leaderboard not available yet.")
 
 st.markdown("---")
 
@@ -200,7 +221,7 @@ else:
     st.success(f"Logged in as: {st.session_state.user}")
     st.sidebar.button("Logout", on_click=lambda: st.session_state.clear())
 
-    # USER RESET PASSWORD
+    # Reset password
     st.sidebar.markdown("### 🔐 Reset My Password")
     new_pass = st.sidebar.text_input("New Password", type="password")
     if st.sidebar.button("Reset Password"):
@@ -284,7 +305,7 @@ else:
             SELECT v.candidate,
                    AVG(v.score) as avg,
                    COUNT(v.id) as votes,
-                   SUM(v.score * u.vote_weight) as total
+                   SUM(v.score * COALESCE(u.vote_weight,1)) as total
             FROM votes v
             JOIN users u ON v.email = u.email
             GROUP BY v.candidate
@@ -330,12 +351,12 @@ else:
     else:
         st.warning("Vote limit reached.")
 
-    # SELF NOMINATION
+    # Self Nomination
     st.markdown("---")
     desc = st.text_area("Nominate Yourself - Description")
     if st.button("Submit Self Nomination"):
         if not conn.execute("SELECT * FROM nominations WHERE name=?",
-                         (st.session_state.user,)).fetchone():
+                            (st.session_state.user,)).fetchone():
             safe_execute(
                 "INSERT INTO nominations (name,description,added_by,added_time) VALUES (?,?,?,?)",
                 (st.session_state.user, desc, st.session_state.user, datetime.now())
@@ -344,41 +365,45 @@ else:
             st.rerun()
 
 # ======================================================
-# MEDAL LEADERBOARD
+# 🏅 MEDAL LEADERBOARD
 # ======================================================
 
 st.markdown("---")
 st.subheader("🏅 Medal Leaderboard")
 
-df = pd.read_sql("""
-SELECT v.candidate,
-       AVG(v.score) as avg,
-       COUNT(v.id) as votes,
-       SUM(v.score * u.vote_weight) as total
-FROM votes v
-JOIN users u ON v.email = u.email
-GROUP BY v.candidate
-ORDER BY total DESC
-""", conn)
+try:
+    df = pd.read_sql("""
+    SELECT v.candidate,
+           AVG(v.score) as avg,
+           COUNT(v.id) as votes,
+           SUM(v.score * COALESCE(u.vote_weight,1)) as total
+    FROM votes v
+    JOIN users u ON v.email = u.email
+    GROUP BY v.candidate
+    ORDER BY total DESC
+    """, conn)
 
-if not df.empty:
+    if not df.empty:
 
-    medals = ["🥇","🥈","🥉"]
-    df["Medal"] = ""
+        medals = ["🥇","🥈","🥉"]
+        df["Medal"] = ""
 
-    for i in range(min(3,len(df))):
-        df.loc[i,"Medal"] = medals[i]
+        for i in range(min(3,len(df))):
+            df.loc[i,"Medal"] = medals[i]
 
-    for _, row in df.iterrows():
-        st.markdown(f"""
-        <div style='padding:15px;margin:10px 0;border-radius:12px;background:#f2f6fc'>
-            <h3>{row['Medal']} {row['candidate']}</h3>
-            ⭐ Avg: {round(row['avg'],2)} |
-            🗳 Votes: {row['votes']} |
-            🔢 Weighted Total: {row['total']}
-        </div>
-        """, unsafe_allow_html=True)
+        for _, row in df.iterrows():
+            st.markdown(f"""
+            <div style='padding:15px;margin:10px 0;border-radius:12px;background:#f2f6fc'>
+                <h3>{row['Medal']} {row['candidate']}</h3>
+                ⭐ Avg: {round(row['avg'],2)} |
+                🗳 Votes: {row['votes']} |
+                🔢 Weighted Total: {row['total']}
+            </div>
+            """, unsafe_allow_html=True)
 
-    st.bar_chart(df.set_index("candidate")["total"])
-else:
-    st.info("No votes yet.")
+        st.bar_chart(df.set_index("candidate")["total"])
+    else:
+        st.info("No votes yet.")
+
+except:
+    st.info("Leaderboard not available yet.")
